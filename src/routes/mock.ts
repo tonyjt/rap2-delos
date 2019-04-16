@@ -5,6 +5,7 @@ import Tree from './utils/tree'
 import urlUtils from './utils/url'
 import * as querystring from 'querystring'
 import { Sequelize } from 'sequelize-typescript';
+import * as urlPkg from 'url'
 
 const attributes: any = { exclude: [] }
 const pt = require('node-print').pt
@@ -113,7 +114,6 @@ const REG_URL_METHOD = /^\/?(get|post|delete|put)/i
 router.all('/app/mock/:repositoryId(\\d+)/:url(.+)', async (ctx) => {
   let app: any = ctx.app
   app.counter.mock++
-
   let { repositoryId, url } = ctx.params
   let method = ctx.request.method
   repositoryId = +repositoryId
@@ -127,10 +127,10 @@ router.all('/app/mock/:repositoryId(\\d+)/:url(.+)', async (ctx) => {
   let urlWithoutPrefixSlash = /(\/)?(.*)/.exec(url)[2]
   // let urlWithoutSearch
   // try {
-    // let urlParts = new URL(url)
-    // urlWithoutSearch = `${urlParts.origin}${urlParts.pathname}`
+  // let urlParts = new URL(url)
+  // urlWithoutSearch = `${urlParts.origin}${urlParts.pathname}`
   // } catch (e) {
-    // urlWithoutSearch = url
+  // urlWithoutSearch = url
   // }
   // DONE 2.3 腐烂的 KISSY
   // KISSY 1.3.2 会把路径中的 // 替换为 /。在浏览器端拦截跨域请求时，需要 encodeURIComponent(url) 以防止 http:// 被替换为 http:/。但是同时也会把参数一起编码，导致 route 的 url 部分包含了参数。
@@ -138,10 +138,9 @@ router.all('/app/mock/:repositoryId(\\d+)/:url(.+)', async (ctx) => {
 
   let repository = await Repository.findById(repositoryId)
   let collaborators: Repository[] = (await repository.$get('collaborators')) as Repository[]
-  let itf
-  // console.log([urlWithoutPrefixSlash, '/' + urlWithoutPrefixSlash, urlWithoutSearch])
+  let itf: Interface
 
-  const matchedItfList = await Interface.findAll({
+  let matchedItfList = await Interface.findAll({
     attributes,
     where: {
       repositoryId: [repositoryId, ...collaborators.map(item => item.id)],
@@ -152,16 +151,61 @@ router.all('/app/mock/:repositoryId(\\d+)/:url(.+)', async (ctx) => {
     }
   })
 
-  if (matchedItfList) {
-    for (const item of matchedItfList) {
-      itf = item
-      let url = item.url
-      if (url.charAt(0) === '/') {
-        url = url.substring(1)
+  function getRelativeURLWithoutParams(url: string) {
+    if (url.indexOf('http://') > -1) {
+      url = url.substring('http://'.length)
+    }
+    if (url.indexOf('https://') > -1) {
+      url = url.substring('https://'.length)
+    }
+    if (url.indexOf('/') > -1) {
+      url = url.substring(url.indexOf('/') + 1)
+    }
+    if (url.indexOf('?') > -1) {
+      url = url.substring(0, url.indexOf('?'))
+    }
+    return url
+  }
+
+  // matching by path
+  if (matchedItfList.length > 1) {
+    matchedItfList = matchedItfList.filter(x => {
+      const urlDoc = getRelativeURLWithoutParams(x.url)
+      const urlRequest = urlWithoutPrefixSlash
+      return urlDoc === urlRequest
+    })
+  }
+
+  // matching by params
+  if (matchedItfList.length > 1) {
+    matchedItfList = matchedItfList.filter(x => {
+      const params = {
+       ... ctx.request.query,
+       ...ctx.request.body,
       }
-      if (url === urlWithoutPrefixSlash) {
-        break
+      const parsedUrl = urlPkg.parse(x.url)
+      const pairs = parsedUrl.query.split('&').map(x => x.split('='))
+      for (const p of pairs) {
+        const key = p[0]
+        const val = p[1]
+        if (params[key] == val) {
+          return true
+        }
       }
+      // for (let key in query) {
+      // }
+      return false
+    })
+  }
+
+  for (const item of matchedItfList) {
+    itf = item
+    let url = item.url
+    if (url.charAt(0) === '/') {
+      url = url.substring(1)
+    }
+    if (url === urlWithoutPrefixSlash) {
+      break
     }
   }
 
@@ -171,7 +215,8 @@ router.all('/app/mock/:repositoryId(\\d+)/:url(.+)', async (ctx) => {
       attributes: ['id', 'url', 'method'],
       where: {
         repositoryId: [repositoryId, ...collaborators.map(item => item.id)],
-      },
+        method,
+      }
     })
 
     let listMatched = []
@@ -182,7 +227,7 @@ router.all('/app/mock/:repositoryId(\\d+)/:url(.+)', async (ctx) => {
     }
 
     if (listMatched.length > 1) {
-      ctx.body = { isOk: false, errMsg: '匹配到多个接口，请修改规则确保接口规则唯一性。 Matched duplicate interfaces, please ensure pattern to be unique.' }
+      ctx.body = { isOk: false, errMsg: '匹配到多个接口，请修改规则确保接口规则唯一性。 Matched multiple interfaces, please ensure pattern to be unique.' }
       return
     } else if (listMatched.length === 0) {
       ctx.body = { isOk: false, errMsg: '未匹配到任何接口 No matched interface' }
@@ -197,6 +242,32 @@ router.all('/app/mock/:repositoryId(\\d+)/:url(.+)', async (ctx) => {
     attributes,
     where: { interfaceId, scope: 'response' },
   })
+  // check required
+  if (~['GET', 'POST'].indexOf(method)) {
+    let requiredProperties = await Property.findAll({
+      attributes,
+      where: { interfaceId, scope: 'request', required: true },
+    })
+    let passed = true
+    let pFailed: Property | undefined
+    let params = method === 'GET' ? ctx.request.query : ctx.request.body
+    for (const p of requiredProperties) {
+      if (typeof params[p.name] === 'undefined') {
+        passed = false
+        pFailed = p
+        break
+      }
+    }
+    if (!passed) {
+      ctx.body = {
+        isOk: false,
+        errMsg: `必选参数${pFailed.name}未传值。 Required parameter ${pFailed.name} has no value.`,
+      }
+      ctx.status = 500
+      return
+    }
+  }
+
   properties = properties.map(item => item.toJSON())
 
   // DONE 2.2 支持引用请求参数
